@@ -13,6 +13,19 @@ import bcrypt from 'bcryptjs';
 import { differenceInDays, parseISO, isValid } from 'date-fns';
 import { Client } from 'pg';
 
+async function test(db: Client) {
+  console.log(`\nTesting connection to Postgres database at ${process.env.DB_HOST}...`);
+  try {
+    const res = await db.query('SELECT NOW() AS current_time, version()');
+    console.log('✅ Connection to Supabase Postgres successful!');
+    console.log('Current Time:', res.rows[0].current_time);
+    console.log('Postgres Version:', res.rows[0].version);
+  } catch (err) {
+    console.error('❌ Connection failed:', err instanceof Error ? err.message : String(err));
+    throw err;
+  }
+}
+
 async function initDb(db: Client) {
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -80,7 +93,7 @@ const db = new Client({
   user: process.env.DB_USER,
   password: process.env.DB_PASS,
   database: process.env.DB_NAME,
-  port: 6543,
+  port: Number(process.env.DB_PORT),
   ssl: {
     rejectUnauthorized: false
   }
@@ -89,6 +102,7 @@ const db = new Client({
 async function startServer() {
   // Connect to Supabase Postgres
   await db.connect();
+  await test(db);
 
   // Ensure schema exists
   await initDb(db);
