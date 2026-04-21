@@ -1,17 +1,98 @@
+import dotenv from 'dotenv';
+import path from 'path';
+
+// Load environment variables from .env.local
+dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
+
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import path from 'path';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import { db, initDb } from './src/lib/db.ts';
-import { differenceInDays, parseISO } from 'date-fns';
+import { differenceInDays, parseISO, isValid } from 'date-fns';
+import { Client } from 'pg';
+
+async function initDb(db: Client) {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE,
+      password TEXT,
+      role TEXT DEFAULT 'admin'
+    );
+    CREATE TABLE IF NOT EXISTS sub_sellers (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      responsible TEXT CHECK(responsible IN ('Gnomo', 'Leo')) NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS clients (
+      id SERIAL PRIMARY KEY,
+      domain TEXT NOT NULL,
+      seller_id INTEGER,
+      sub_seller_id INTEGER,
+      client_email TEXT,
+      client_phone TEXT,
+      hosting_expiry TEXT,
+      hosting_price REAL,
+      hosting_cycle INTEGER,
+      ssl_manual_90d INTEGER DEFAULT 0,
+      ssl_technical_expiry TEXT,
+      ssl_commercial_expiry TEXT,
+      ssl_price REAL,
+      CONSTRAINT fk_sub_seller FOREIGN KEY(sub_seller_id) REFERENCES sub_sellers(id)
+    );
+    CREATE TABLE IF NOT EXISTS payments (
+      id SERIAL PRIMARY KEY,
+      client_id INTEGER,
+      date TEXT NOT NULL,
+      amount REAL NOT NULL,
+      currency TEXT NOT NULL,
+      concept TEXT NOT NULL,
+      CONSTRAINT fk_client FOREIGN KEY(client_id) REFERENCES clients(id)
+    );
+  `);
+
+  // Seed if empty — password is 'admin'
+  const { rows } = await db.query('SELECT count(*) as count FROM users');
+  if (parseInt(rows[0].count) === 0) {
+    // Real bcrypt hash of 'admin'
+    const adminHash = '$2b$10$aYyTBuDBrIH.qNYFYEwmB.jV2UOR6bydeKOe.TjeJvdHVicEDWS22';
+    await db.query('INSERT INTO users (username, password) VALUES ($1, $2)', ['admin', adminHash]);
+    await db.query('INSERT INTO sub_sellers (name, responsible) VALUES ($1, $2)', ['Vendedor 1', 'Gnomo']);
+    await db.query('INSERT INTO sub_sellers (name, responsible) VALUES ($1, $2)', ['Vendedor 2', 'Leo']);
+
+    const now = new Date();
+    const addDays = (d: number) => { const dt = new Date(now); dt.setDate(dt.getDate() + d); return dt.toISOString().split('T')[0]; };
+    await db.query(`INSERT INTO clients (domain, sub_seller_id, client_email, client_phone, hosting_expiry, ssl_technical_expiry, ssl_price) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      ['google.com', 1, 'contact@google.com', '+123456789', addDays(5), addDays(8), 50.0]);
+    await db.query(`INSERT INTO clients (domain, sub_seller_id, client_email, client_phone, hosting_expiry, ssl_technical_expiry, ssl_price) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      ['apple.com', 2, 'ceo@apple.com', '+987654321', addDays(15), addDays(25), 100.0]);
+    await db.query(`INSERT INTO clients (domain, sub_seller_id, client_email, client_phone, hosting_expiry, ssl_technical_expiry, ssl_price) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      ['amazon.com', 1, 'jeff@amazon.com', '+1122334455', addDays(40), addDays(50), 120.0]);
+  }
+}
 
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecret';
 
+const db = new Client({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
+  port: 6543,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
 async function startServer() {
-  initDb();
+  // Connect to Supabase Postgres
+  await db.connect();
+
+  // Ensure schema exists
+  await initDb(db);
+
   const app = express();
   const PORT = 3000;
 
@@ -22,7 +103,7 @@ async function startServer() {
   // --- Auth Middleware ---
   const authenticateToken = (req: any, res: any, next: any) => {
     const token = req.cookies.token;
-    if (!token) return res.status(401).json({ error: 'Access denied' });
+    if (!token) return res.status(401).json({ error: 'Access denied 2' });
 
     try {
       const verified = jwt.verify(token, JWT_SECRET);
@@ -36,10 +117,10 @@ async function startServer() {
   // --- API Routes ---
 
   // Auth
-  app.post('/api/login', (req, res) => {
+  app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-    const user: any = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-
+    const result = await db.query('SELECT * FROM users WHERE username = $1', [username]);
+    const user = result.rows[0];
     if (!user || !bcrypt.compareSync(password, user.password)) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
     }
@@ -59,24 +140,28 @@ async function startServer() {
   });
 
   // Clients
-  app.get('/api/clients', authenticateToken, (req, res) => {
-    const clients = db.prepare(`
+  app.get('/api/clients', authenticateToken, async (req, res) => {
+    const result = await db.query(`
       SELECT c.*, s.name as sub_seller_name, s.responsible as responsible
       FROM clients c
       LEFT JOIN sub_sellers s ON c.sub_seller_id = s.id
-    `).all();
+    `);
+    const clients = result.rows;
 
     // Add health status logic
     const clientsWithHealth = clients.map((c: any) => {
-      const hExpiry = c.hosting_expiry ? parseISO(c.hosting_expiry) : null;
-      const sExpiry = c.ssl_technical_expiry ? parseISO(c.ssl_technical_expiry) : null;
-      
-      const dates = [hExpiry, sExpiry].filter(Boolean) as Date[];
+      const hExpiryStr = c.hosting_expiry ? String(c.hosting_expiry).replace(/\//g, '-') : null;
+      const sExpiryStr = c.ssl_technical_expiry ? String(c.ssl_technical_expiry).replace(/\//g, '-') : null;
+
+      const hExpiry = hExpiryStr ? parseISO(hExpiryStr) : null;
+      const sExpiry = sExpiryStr ? parseISO(sExpiryStr) : null;
+
+      const dates = [hExpiry, sExpiry].filter(d => d && isValid(d)) as Date[];
       if (dates.length === 0) return { ...c, health: 'green', daysRemaining: 999 };
 
       const minDate = new Date(Math.min(...dates.map(d => d.getTime())));
       const days = differenceInDays(minDate, new Date());
-      
+
       let health = 'green';
       if (days < 10) health = 'red';
       else if (days < 20) health = 'orange';
@@ -96,46 +181,59 @@ async function startServer() {
     res.json(sorted);
   });
 
-  app.get('/api/clients/:id/payments', authenticateToken, (req, res) => {
-    const payments = db.prepare('SELECT * FROM payments WHERE client_id = ? ORDER BY date DESC').all(req.params.id);
-    res.json(payments);
+  app.get('/api/clients/:id/payments', authenticateToken, async (req, res) => {
+    const result = await db.query('SELECT * FROM payments WHERE client_id = $1 ORDER BY date DESC', [req.params.id]);
+    res.json(result.rows);
   });
 
-  app.post('/api/clients/:id/renew-ssl', authenticateToken, (req, res) => {
+  app.post('/api/clients/:id/renew-ssl', authenticateToken, async (req, res) => {
     const newExpiry = new Date();
     newExpiry.setDate(newExpiry.getDate() + 90);
-    db.prepare('UPDATE clients SET ssl_technical_expiry = ? WHERE id = ?').run(newExpiry.toISOString().split('T')[0], req.params.id);
+    await db.query('UPDATE clients SET ssl_technical_expiry = $1 WHERE id = $2', [newExpiry.toISOString().split('T')[0], req.params.id]);
     res.json({ success: true, newExpiry });
   });
 
-  app.post('/api/clients/:id/record-payment', authenticateToken, (req, res) => {
+  app.post('/api/clients/:id/record-payment', authenticateToken, async (req, res) => {
     const { amount, currency, concept } = req.body;
     const date = new Date().toISOString().split('T')[0];
-    
-    db.prepare('INSERT INTO payments (client_id, date, amount, currency, concept) VALUES (?, ?, ?, ?, ?)')
-      .run(req.params.id, date, amount, currency, concept);
-    
+
+    await db.query('INSERT INTO payments (client_id, date, amount, currency, concept) VALUES ($1, $2, $3, $4, $5)',
+      [req.params.id, date, amount, currency, concept]);
+
     // Auto-renew hosting for 1 year if concept includes hosting
     if (concept.toLowerCase().includes('hosting')) {
-      const client: any = db.prepare('SELECT hosting_expiry FROM clients WHERE id = ?').get(req.params.id);
-      const current = client.hosting_expiry ? parseISO(client.hosting_expiry) : new Date();
+      const result = await db.query('SELECT hosting_expiry FROM clients WHERE id = $1', [req.params.id]);
+      const client = result.rows[0];
+
+      let current = new Date();
+      if (client?.hosting_expiry) {
+        const normalized = String(client.hosting_expiry).replace(/\//g, '-');
+        const parsed = parseISO(normalized);
+        if (isValid(parsed)) {
+          current = parsed;
+        }
+      }
+
       const next = new Date(current);
       next.setFullYear(next.getFullYear() + 1);
-      db.prepare('UPDATE clients SET hosting_expiry = ? WHERE id = ?').run(next.toISOString().split('T')[0], req.params.id);
+
+      if (isValid(next)) {
+        await db.query('UPDATE clients SET hosting_expiry = $1 WHERE id = $2', [next.toISOString().split('T')[0], req.params.id]);
+      }
     }
 
     res.json({ success: true });
   });
 
   // Sub-sellers
-  app.get('/api/sub-sellers', authenticateToken, (req, res) => {
-    const sellers = db.prepare('SELECT * FROM sub_sellers').all();
-    res.json(sellers);
+  app.get('/api/sub-sellers', authenticateToken, async (req, res) => {
+    const result = await db.query('SELECT * FROM sub_sellers');
+    res.json(result.rows);
   });
 
-  app.post('/api/sub-sellers', authenticateToken, (req, res) => {
+  app.post('/api/sub-sellers', authenticateToken, async (req, res) => {
     const { name, responsible } = req.body;
-    db.prepare('INSERT INTO sub_sellers (name, responsible) VALUES (?, ?)').run(name, responsible);
+    await db.query('INSERT INTO sub_sellers (name, responsible) VALUES ($1, $2)', [name, responsible]);
     res.json({ success: true });
   });
 
